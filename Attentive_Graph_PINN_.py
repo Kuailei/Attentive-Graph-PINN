@@ -1,40 +1,70 @@
-import pandas as pd
+import os
+import copy
+import random
+import warnings
+warnings.filterwarnings("ignore")
+
 import numpy as np
+import pandas as pd
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.metrics import mean_absolute_error, r2_score, roc_auc_score
-import random
-import os
-import copy
+from sklearn.metrics import mean_absolute_error, r2_score
+from sklearn.mixture import GaussianMixture
+
+from sklearn.linear_model import LinearRegression, ElasticNet
+from sklearn.svm import SVR
+from sklearn.ensemble import RandomForestRegressor
+
+try:
+    from xgboost import XGBRegressor
+    HAS_XGB = True
+except Exception:
+    HAS_XGB = False
+
+try:
+    from lightgbm import LGBMRegressor
+    HAS_LGBM = True
+except Exception:
+    HAS_LGBM = False
 
 
-# ==========================================
-# 0. 固定随机种子
-# ==========================================
+# =========================================================
+# 0. Reproducibility
+# =========================================================
 def seed_everything(seed=3407):
     random.seed(seed)
-    os.environ['PYTHONHASHSEED'] = str(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    if torch.backends.cudnn.is_available():
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 
 seed_everything(3407)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ==========================================
-# 1. 数据准备
-# ==========================================
-# 请修改为你的实际路径
-df = pd.read_csv('/home/zhf/df1.csv')
 
-current_nodes = [
+# =========================================================
+# 1. User settings
+# =========================================================
+CSV_PATH = "/mnt/data/df1.csv"      # 改成你的数据路径
+OUTPUT_DIR = "./ai_outputs_7_3"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+TARGET_COL = "Hippocampus_volume"
+ID_COL = "PID"
+BMI_GROUP_COL = "BMI_cat"
+
+NODE_COLS = [
     "Hippocampus_SUL", "adrenal_gland_SUL", "pancreas_SUL",
     "liver_SUL", "spleen_SUL", "vertebrae_SUL", "aorta_SUL",
     "kidney_SUL", "stomach_SUL", "VAT_SUL", "SAT_SUL", "lung_SUL",
@@ -42,144 +72,244 @@ current_nodes = [
     "spinal_cord_SUL"
 ]
 
-# 清洗数据
-df_clean = df.dropna(subset=current_nodes + ['Hippocampus_volume', 'age', 'sex', 'BMI', 'brain_volume'])
-df_normal = df_clean[df_clean['BMI_cat'] == 'Normal_weight'][current_nodes]
-n_hc = len(df_normal)
+COV_COLS = ["sex", "BMI", "brain_volume"]
+AGE_COL = "age"
+
+NORMAL_LABEL = "Normal_weight"
+EDGE_THRESHOLD = 0.12
+
+TEST_SIZE = 0.30          # 7:3
+EPOCHS = 300
+PATIENCE = 40
+LR = 0.005
+WEIGHT_DECAY = 0.001
+EARLYSTOP_MONITOR_RATIO = 0.15   # 从训练集内部再切一小块做早停监控
 
 
-# 构建网络函数
-def calculate_pcor_safe(data_df):
+# =========================================================
+# 2. Utilities
+# =========================================================
+def calculate_pcor_safe(data_df: pd.DataFrame):
+    """
+    Partial correlation estimated from inverse correlation matrix.
+    """
     try:
-        corr_matrix = data_df.corr().values
+        corr_matrix = data_df.corr().values.astype(float)
         precision_matrix = np.linalg.inv(corr_matrix)
         diag_sqrt = np.sqrt(np.diag(precision_matrix))
         pcor_matrix = -precision_matrix / np.outer(diag_sqrt, diag_sqrt)
         np.fill_diagonal(pcor_matrix, 1.0)
         return pcor_matrix
-    except:
+    except Exception:
         return None
 
 
-ref_net = calculate_pcor_safe(df_normal)
-pinn_data_list = []
-
-print("正在构建数据特征...")
-for idx, row in df_clean.iterrows():
-    subj_data = row[current_nodes].values.reshape(1, -1).astype(float)
-    df_ptb = pd.concat([df_normal, pd.DataFrame(subj_data, columns=current_nodes)], ignore_index=True)
-    ptb_net = calculate_pcor_safe(df_ptb.astype(float))
-
-    if ptb_net is None: continue
-
-    res_net = ptb_net - ref_net
-    denom = (1 - ref_net ** 2) / (n_hc - 1)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        zcc_matrix = np.divide(res_net, denom)
-    np.fill_diagonal(zcc_matrix, 0)
-
-    # 阈值过滤
-    abs_zcc = np.abs(zcc_matrix)
-    abs_zcc[abs_zcc < 0.12] = 0.0
-    str_nodes = np.sum(abs_zcc, axis=1)
-
-    pinn_data_list.append({
-        'x_str': str_nodes,
-        'x_raw': subj_data.flatten(),
-        'adj': abs_zcc,
-        'x_cov': row[['sex', 'BMI', 'brain_volume']].values.astype(float),
-        'age': row['age'],
-        'y': row['Hippocampus_volume'],
-        'pid': row['PID']
-    })
-
-# 准备全量数据
-X_str_all = np.array([d['x_str'] for d in pinn_data_list]).reshape(-1, 17, 1)
-X_raw_all = np.array([d['x_raw'] for d in pinn_data_list])
-Adj_all = np.array([d['adj'] for d in pinn_data_list])
-X_cov_all = np.array([d['x_cov'] for d in pinn_data_list])
-Age_all = np.array([d['age'] for d in pinn_data_list]).reshape(-1, 1)
-Y_all = np.array([d['y'] for d in pinn_data_list]).reshape(-1, 1)
-
-# 划分索引
-indices = np.arange(len(Y_all))
-train_idx, test_idx = train_test_split(indices, test_size=0.2, random_state=42)
-
-# 标准化
-scaler_str = StandardScaler()
-X_str_all_norm = scaler_str.fit_transform(X_str_all.reshape(len(Y_all), -1)).reshape(-1, 17, 1)
-scaler_raw = StandardScaler()
-X_raw_all_norm = scaler_raw.fit_transform(X_raw_all)
-scaler_cov = StandardScaler()
-X_cov_all_norm = scaler_cov.fit_transform(X_cov_all)
-age_min, age_max = Age_all.min(), Age_all.max()
-Age_all_norm = (Age_all - age_min) / (age_max - age_min)
-scaler_y = MinMaxScaler()
-scaler_y.fit(Y_all[train_idx])
-Y_all_norm = scaler_y.transform(Y_all)
-
-# 转 Tensor
-t_X_str = torch.FloatTensor(X_str_all_norm)
-t_X_raw = torch.FloatTensor(X_raw_all_norm)
-t_A = torch.FloatTensor(Adj_all)
-t_C = torch.FloatTensor(X_cov_all_norm)
-t_Ag = torch.FloatTensor(Age_all_norm)
-t_Y = torch.FloatTensor(Y_all_norm)
-
-train_idx_torch = torch.tensor(train_idx, dtype=torch.long)
-test_idx_torch = torch.tensor(test_idx, dtype=torch.long)
+def build_reference_network(train_df: pd.DataFrame, node_cols, bmi_group_col, normal_label):
+    ref_df = train_df.loc[train_df[bmi_group_col] == normal_label, node_cols].astype(float)
+    if ref_df.shape[0] < 10:
+        raise ValueError("Too few normal-weight participants in the training set to build reference network.")
+    ref_net = calculate_pcor_safe(ref_df)
+    if ref_net is None:
+        raise ValueError("Reference network construction failed.")
+    return ref_df, ref_net
 
 
-# ==========================================
-# 关键修复工具函数: 手动反归一化
-# ==========================================
-def safe_inverse(scaler, data_tensor_or_numpy):
+def build_features_from_reference(
+    df_subset,
+    ref_df,
+    ref_net,
+    node_cols,
+    cov_cols,
+    age_col,
+    target_col,
+    id_col,
+    edge_threshold=0.12
+):
     """
-    手动执行 MinMaxScaler 的反归一化，
-    彻底绕过 sklearn check_array 的内存共享报错。
-    公式: X_orig = (X_scaled - min_) / scale_
+    用训练集参考网络，为每个样本构建 subject-level features
     """
-    # 1. 确保是 numpy 数组
-    if torch.is_tensor(data_tensor_or_numpy):
-        # detach 并转 numpy，astype 确保数据纯净
-        data = data_tensor_or_numpy.detach().cpu().numpy().astype(np.float64)
+    n_ref = len(ref_df)
+    data_list = []
+
+    for _, row in df_subset.iterrows():
+        subj_data = row[node_cols].values.reshape(1, -1).astype(float)
+        df_ptb = pd.concat([ref_df, pd.DataFrame(subj_data, columns=node_cols)], ignore_index=True)
+        ptb_net = calculate_pcor_safe(df_ptb.astype(float))
+        if ptb_net is None:
+            continue
+
+        res_net = ptb_net - ref_net
+        denom = (1 - ref_net ** 2) / (n_ref - 1)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            zcc_matrix = np.divide(res_net, denom)
+
+        zcc_matrix = np.nan_to_num(zcc_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+        np.fill_diagonal(zcc_matrix, 0.0)
+
+        abs_zcc = np.abs(zcc_matrix)
+        abs_zcc[abs_zcc < edge_threshold] = 0.0
+        str_nodes = np.sum(abs_zcc, axis=1)
+
+        data_list.append({
+            "pid": row[id_col],
+            "x_str": str_nodes.astype(np.float32),
+            "x_raw": row[node_cols].values.astype(np.float32),
+            "adj": abs_zcc.astype(np.float32),
+            "x_cov": row[cov_cols].values.astype(np.float32),
+            "age": float(row[age_col]),
+            "y": float(row[target_col])
+        })
+
+    return data_list
+
+
+def fit_feature_scalers(train_data):
+    X_str = np.array([d["x_str"] for d in train_data]).reshape(len(train_data), -1)
+    X_raw = np.array([d["x_raw"] for d in train_data])
+    X_cov = np.array([d["x_cov"] for d in train_data])
+    Age = np.array([d["age"] for d in train_data]).reshape(-1, 1)
+    Y = np.array([d["y"] for d in train_data]).reshape(-1, 1)
+
+    scaler_str = StandardScaler().fit(X_str)
+    scaler_raw = StandardScaler().fit(X_raw)
+    scaler_cov = StandardScaler().fit(X_cov)
+    scaler_y = MinMaxScaler().fit(Y)
+
+    age_min = float(Age.min())
+    age_max = float(Age.max())
+    age_range = max(age_max - age_min, 1e-8)
+
+    return {
+        "scaler_str": scaler_str,
+        "scaler_raw": scaler_raw,
+        "scaler_cov": scaler_cov,
+        "scaler_y": scaler_y,
+        "age_min": age_min,
+        "age_max": age_max,
+        "age_range": age_range
+    }
+
+
+def transform_data(data_list, scalers):
+    X_str = np.array([d["x_str"] for d in data_list]).reshape(len(data_list), -1)
+    X_raw = np.array([d["x_raw"] for d in data_list])
+    Adj = np.array([d["adj"] for d in data_list])
+    X_cov = np.array([d["x_cov"] for d in data_list])
+    Age = np.array([d["age"] for d in data_list]).reshape(-1, 1)
+    Y = np.array([d["y"] for d in data_list]).reshape(-1, 1)
+    PIDs = np.array([d["pid"] for d in data_list])
+
+    X_str = scalers["scaler_str"].transform(X_str).reshape(len(data_list), len(NODE_COLS), 1)
+    X_raw = scalers["scaler_raw"].transform(X_raw)
+    X_cov = scalers["scaler_cov"].transform(X_cov)
+    Age = (Age - scalers["age_min"]) / scalers["age_range"]
+    Y_norm = scalers["scaler_y"].transform(Y)
+
+    return {
+        "pid": PIDs,
+        "x_str": torch.tensor(X_str, dtype=torch.float32, device=DEVICE),
+        "x_raw": torch.tensor(X_raw, dtype=torch.float32, device=DEVICE),
+        "adj": torch.tensor(Adj, dtype=torch.float32, device=DEVICE),
+        "x_cov": torch.tensor(X_cov, dtype=torch.float32, device=DEVICE),
+        "age": torch.tensor(Age, dtype=torch.float32, device=DEVICE),
+        "y": torch.tensor(Y_norm, dtype=torch.float32, device=DEVICE),
+        "y_real": Y.flatten()
+    }
+
+
+def split_tensor_dict(tensor_dict, train_ratio=0.85, random_state=3407):
+    """
+    从训练集内部切出一部分作为 early-stopping monitor
+    """
+    n = len(tensor_dict["pid"])
+    idx = np.arange(n)
+
+    fit_idx, monitor_idx = train_test_split(
+        idx,
+        test_size=(1 - train_ratio),
+        random_state=random_state
+    )
+
+    def subset_dict(d, indices):
+        out = {}
+        for k, v in d.items():
+            if isinstance(v, np.ndarray):
+                out[k] = v[indices]
+            elif torch.is_tensor(v):
+                out[k] = v[indices]
+            else:
+                out[k] = v
+        return out
+
+    return subset_dict(tensor_dict, fit_idx), subset_dict(tensor_dict, monitor_idx)
+
+
+def safe_inverse_minmax(scaler, tensor_or_numpy):
+    if torch.is_tensor(tensor_or_numpy):
+        x = tensor_or_numpy.detach().cpu().numpy().astype(np.float64)
     else:
-        data = np.array(data_tensor_or_numpy, dtype=np.float64)
+        x = np.asarray(tensor_or_numpy, dtype=np.float64)
 
-    # 2. 展平以便计算
-    data = data.reshape(-1, 1)
-
-    # 3. 手动提取参数 (MinMaxScaler 属性)
+    x = x.reshape(-1, 1)
     scale = scaler.scale_[0]
     min_val = scaler.min_[0]
-
-    # 4. 数学运算
-    data_orig = (data - min_val) / scale
-
-    return data_orig.flatten()
+    x_orig = (x - min_val) / scale
+    return x_orig.flatten()
 
 
-# ==========================================
-# 模型定义
-# ==========================================
+def get_metrics(y_true, y_pred):
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+
+    n = len(y_true)
+    if n <= 1:
+        c_index = np.nan
+    else:
+        v, c = 0, 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                if y_true[i] != y_true[j]:
+                    v += 1
+                    if (y_pred[i] - y_pred[j]) * (y_true[i] - y_true[j]) > 0:
+                        c += 1
+                    elif y_pred[i] == y_pred[j]:
+                        c += 0.5
+        c_index = c / v if v > 0 else np.nan
+
+    return {"MAE": mae, "R2": r2, "C_index": c_index}
+
+
+def flatten_baseline_features(tensor_dict):
+    x_str = tensor_dict["x_str"].detach().cpu().numpy().reshape(len(tensor_dict["pid"]), -1)
+    x_raw = tensor_dict["x_raw"].detach().cpu().numpy()
+    x_cov = tensor_dict["x_cov"].detach().cpu().numpy()
+    age = tensor_dict["age"].detach().cpu().numpy()
+    X = np.concatenate([x_str, x_raw, x_cov, age], axis=1)
+    y = tensor_dict["y_real"]
+    return X, y
+
+
+# =========================================================
+# 3. Model definitions
+# =========================================================
 class GraphConvolution(nn.Module):
     def __init__(self, in_features, out_features):
         super().__init__()
         self.linear = nn.Linear(in_features, out_features)
 
     def forward(self, x, adj):
-        B, N, _ = adj.shape
-        I = torch.eye(N, device=adj.device).unsqueeze(0).expand(B, -1, -1)
+        bsz, n_nodes, _ = adj.shape
+        I = torch.eye(n_nodes, device=adj.device).unsqueeze(0).expand(bsz, -1, -1)
         A_hat = adj + I
         D_inv = torch.pow(torch.sum(A_hat, dim=2), -0.5)
-        D_inv[torch.isinf(D_inv)] = 0.
+        D_inv[torch.isinf(D_inv)] = 0.0
         D_mat = torch.diag_embed(D_inv)
         support = torch.bmm(torch.bmm(D_mat, A_hat), D_mat)
         return self.linear(torch.bmm(support, x))
 
 
-# --- 模型 1: GNN Only ---
-class GNN_Only(nn.Module):
+class GNNOnly(nn.Module):
     def __init__(self, num_nodes=17, node_in=1, raw_in=17, cov_dim=3, hidden_dim=32):
         super().__init__()
         self.gc1 = GraphConvolution(node_in, hidden_dim)
@@ -201,43 +331,49 @@ class GNN_Only(nn.Module):
         h = self.dropout(h)
         h = F.elu(self.gc2(h, adj))
         h = self.bn(h)
-        graph_emb = torch.mean(h, dim=1)  # Mean Pooling
+        graph_emb = torch.mean(h, dim=1)
         combined = torch.cat([graph_emb, x_raw, x_cov, age], dim=1)
         pred = torch.sigmoid(self.regressor(combined))
-        return pred  # 单值返回
+        return pred
 
 
-# --- 模型 2: GNN + PINN ---
-class GNN_PINN(nn.Module):
+class GNNPINN(nn.Module):
     def __init__(self, num_nodes=17, node_in=1, raw_in=17, cov_dim=3, hidden_dim=32):
         super().__init__()
         self.beta_net = nn.Sequential(
-            nn.Linear(raw_in + cov_dim, 32), nn.Tanh(), nn.Dropout(0.2), nn.Linear(32, 1)
+            nn.Linear(raw_in + cov_dim, 32),
+            nn.Tanh(),
+            nn.Dropout(0.2),
+            nn.Linear(32, 1)
         )
         self.gc1 = GraphConvolution(node_in, hidden_dim)
         self.gc2 = GraphConvolution(hidden_dim, hidden_dim)
         self.dropout = nn.Dropout(0.3)
         self.bn = nn.BatchNorm1d(num_nodes)
         self.alpha_head = nn.Sequential(
-            nn.Linear(hidden_dim + raw_in, 16), nn.ReLU(), nn.Linear(16, 1)
+            nn.Linear(hidden_dim + raw_in, 16),
+            nn.ReLU(),
+            nn.Linear(16, 1)
         )
 
     def forward(self, x_str, x_raw, adj, x_cov, age):
         beta_in = torch.cat([x_raw, x_cov], dim=1)
         beta = torch.sigmoid(self.beta_net(beta_in))
+
         h = F.elu(self.gc1(x_str, adj))
         h = self.dropout(h)
         h = F.elu(self.gc2(h, adj))
         h = self.bn(h)
-        graph_emb = torch.mean(h, dim=1)  # Mean Pooling
+        graph_emb = torch.mean(h, dim=1)
+
         alpha_in = torch.cat([graph_emb, x_raw], dim=1)
         decay_rate = F.softplus(self.alpha_head(alpha_in))
+
         pred = beta * (1.0 - decay_rate * age)
-        return pred  # 单值返回
+        return pred
 
 
-# --- 模型 3: Attentive Graph PINN ---
-class Attentive_Graph_PINN(nn.Module):
+class AttentiveGraphPINN(nn.Module):
     def __init__(self, num_nodes=17, node_in=1, raw_in=17, cov_dim=3, hidden_dim=32):
         super().__init__()
         self.beta_net = nn.Sequential(
@@ -250,6 +386,7 @@ class Attentive_Graph_PINN(nn.Module):
         self.gc2 = GraphConvolution(hidden_dim, hidden_dim)
         self.dropout = nn.Dropout(0.3)
         self.bn = nn.BatchNorm1d(num_nodes)
+
         self.attn_net = nn.Sequential(nn.Linear(hidden_dim, 1))
         self.node_alpha_net = nn.Sequential(nn.Linear(hidden_dim, 1), nn.Softplus())
         self.alpha_fusion = nn.Sequential(
@@ -263,6 +400,7 @@ class Attentive_Graph_PINN(nn.Module):
         h = self.dropout(h)
         h = F.elu(self.gc2(h, adj))
         h = self.bn(h)
+
         attn_scores = self.attn_net(h)
         weights = torch.softmax(attn_scores, dim=1)
         alpha_node = self.node_alpha_net(h)
@@ -274,171 +412,301 @@ class Attentive_Graph_PINN(nn.Module):
         alpha_in = torch.cat([graph_emb, x_raw], dim=1)
         decay_rate = F.softplus(self.alpha_fusion(alpha_in))
 
-        pred = beta * (1.0 - decay_rate * age)
-
-        # 返回5个值
+        pred = beta * torch.exp(-decay_rate * age)
         return pred, beta, decay_rate, alpha_node.squeeze(-1), weights.squeeze(-1)
 
 
-# ==========================================
-# 3. 实验运行与评估函数 (集成修复)
-# ==========================================
-def get_metrics(y_true, y_pred):
-    mae = mean_absolute_error(y_true, y_pred)
-    r2 = r2_score(y_true, y_pred)
-
-    # C-index 计算
-    n = len(y_true)
-    idxs = np.random.choice(n, min(n, 2000), replace=False)
-    yt, yp = y_true[idxs], y_pred[idxs]
-    v, c = 0, 0
-    for i in range(len(yt)):
-        for j in range(i + 1, len(yt)):
-            if yt[i] != yt[j]:
-                v += 1
-                if (yp[i] - yp[j]) * (yt[i] - yt[j]) > 0:
-                    c += 1
-                elif yp[i] == yp[j]:
-                    c += 0.5
-    c_index = c / v if v > 0 else 0
-    return mae, r2, c_index
-
-
-def run_experiment(model_name, model_class):
+# =========================================================
+# 4. Training / evaluation
+# =========================================================
+def run_torch_model(
+    model_name,
+    model_class,
+    train_t,
+    test_t,
+    scaler_y,
+    epochs=300,
+    patience=40,
+    earlystop_monitor_ratio=0.15
+):
     seed_everything(3407)
-    model = model_class()
-    optimizer = optim.AdamW(model.parameters(), lr=0.005, weight_decay=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=20, factor=0.5)
+
+    # 从训练集内部切出 monitor set 做 early stopping
+    fit_t, monitor_t = split_tensor_dict(
+        train_t,
+        train_ratio=(1 - earlystop_monitor_ratio),
+        random_state=3407
+    )
+
+    model = model_class().to(DEVICE)
+    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=15, factor=0.5)
     criterion = nn.MSELoss()
 
-    best_test_mae = float('inf')
+    best_monitor_mae = np.inf
     best_state = None
-
-    epochs = 300
+    patience_counter = 0
+    history = []
 
     for epoch in range(epochs):
         model.train()
         optimizer.zero_grad()
 
-        # 兼容单值或多值返回
-        out = model(t_X_str[train_idx_torch], t_X_raw[train_idx_torch], t_A[train_idx_torch], t_C[train_idx_torch],
-                    t_Ag[train_idx_torch])
-        if isinstance(out, tuple):
-            p = out[0]
-        else:
-            p = out
-
-        loss = criterion(p.view(-1, 1), t_Y[train_idx_torch].view(-1, 1))
+        out = model(fit_t["x_str"], fit_t["x_raw"], fit_t["adj"], fit_t["x_cov"], fit_t["age"])
+        pred_fit = out[0] if isinstance(out, tuple) else out
+        loss = criterion(pred_fit.view(-1, 1), fit_t["y"].view(-1, 1))
         loss.backward()
         optimizer.step()
 
-        # 验证
         model.eval()
         with torch.no_grad():
-            out_test = model(t_X_str[test_idx_torch], t_X_raw[test_idx_torch], t_A[test_idx_torch], t_C[test_idx_torch],
-                             t_Ag[test_idx_torch])
-            if isinstance(out_test, tuple):
-                p_test = out_test[0]
-            else:
-                p_test = out_test
+            out_monitor = model(
+                monitor_t["x_str"], monitor_t["x_raw"], monitor_t["adj"],
+                monitor_t["x_cov"], monitor_t["age"]
+            )
+            pred_monitor = out_monitor[0] if isinstance(out_monitor, tuple) else out_monitor
+            pred_monitor_real = safe_inverse_minmax(scaler_y, pred_monitor)
+            y_monitor_real = monitor_t["y_real"]
+            monitor_mae = mean_absolute_error(y_monitor_real, pred_monitor_real)
 
-            # 【修复点 1】: 使用 safe_inverse 替代 scaler_y.inverse_transform
-            p_test_real = safe_inverse(scaler_y, p_test)
-            y_real = safe_inverse(scaler_y, t_Y[test_idx_torch])
+        scheduler.step(loss.item())
+        history.append((epoch + 1, float(loss.item()), float(monitor_mae)))
 
-            mae = mean_absolute_error(y_real, p_test_real)
+        if monitor_mae < best_monitor_mae:
+            best_monitor_mae = monitor_mae
+            best_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
 
-            if mae < best_test_mae:
-                best_test_mae = mae
-                best_state = copy.deepcopy(model.state_dict())
+        if patience_counter >= patience:
+            break
 
-        scheduler.step(loss)
-
-    # 加载最佳模型
     model.load_state_dict(best_state)
     model.eval()
-    with torch.no_grad():
-        # Train 预测
-        out_tr = model(t_X_str[train_idx_torch], t_X_raw[train_idx_torch], t_A[train_idx_torch], t_C[train_idx_torch],
-                       t_Ag[train_idx_torch])
-        p_train = out_tr[0] if isinstance(out_tr, tuple) else out_tr
 
-        # Test 预测
-        out_te = model(t_X_str[test_idx_torch], t_X_raw[test_idx_torch], t_A[test_idx_torch], t_C[test_idx_torch],
-                       t_Ag[test_idx_torch])
-        p_test = out_te[0] if isinstance(out_te, tuple) else out_te
-
-        # 【修复点 2】: 使用 safe_inverse
-        p_train_real = safe_inverse(scaler_y, p_train)
-        y_train_real = safe_inverse(scaler_y, t_Y[train_idx_torch])
-
-        p_test_real = safe_inverse(scaler_y, p_test)
-        y_test_real = safe_inverse(scaler_y, t_Y[test_idx_torch])
-
-    tr_m, tr_r, tr_c = get_metrics(y_train_real, p_train_real)
-    te_m, te_r, te_c = get_metrics(y_test_real, p_test_real)
-
-    # ----------------------------------------------------
-    # 导出 CSV (Attentive 模型专用)
-    # ----------------------------------------------------
-    if model_name == "Attentive Graph PINN":
-        print("\n>>> 正在为 Attentive Graph PINN 导出详细结果到 CSV...")
+    def infer(split_t):
         with torch.no_grad():
-            out_all = model(t_X_str, t_X_raw, t_A, t_C, t_Ag)
-            # 解包所有返回值
-            p_all_norm, beta_all, a_gl_all, a_nd_all, w_all = out_all
+            out = model(split_t["x_str"], split_t["x_raw"], split_t["adj"], split_t["x_cov"], split_t["age"])
+            if isinstance(out, tuple):
+                pred_norm = out[0]
+                extras = out[1:]
+            else:
+                pred_norm = out
+                extras = None
 
-            # 【修复点 3】: 使用 safe_inverse
-            y_pred_all = safe_inverse(scaler_y, p_all_norm)
-            y_true_all = safe_inverse(scaler_y, t_Y)
+            pred_real = safe_inverse_minmax(scaler_y, pred_norm)
+            y_real = split_t["y_real"]
+            metrics = get_metrics(y_real, pred_real)
+            return pred_real, y_real, metrics, extras
 
-            organ_names = [n.replace('_SUL', '') for n in current_nodes]
-            all_pids = [d['pid'] for d in pinn_data_list]
+    pred_train, y_train, met_train, _ = infer(train_t)
+    pred_test, y_test, met_test, extras_test = infer(test_t)
 
-            export_df = pd.DataFrame({
-                'PID': all_pids,
-                'Set': ['Train' if i in train_idx else 'Test' for i in range(len(y_pred_all))],
-                'Actual_mL': y_true_all,
-                'Pred_mL': y_pred_all,
-                'Global_Alpha': a_gl_all.cpu().numpy().flatten()
-            })
+    result = {
+        "model_name": model_name,
+        "model": model,
+        "history": history,
+        "train_metrics": met_train,
+        "test_metrics": met_test,
+        "pred_train": pred_train,
+        "pred_test": pred_test,
+        "y_train": y_train,
+        "y_test": y_test
+    }
 
-            metrics_map = {
-                'Train': {'MAE': tr_m, 'R2': tr_r, 'C_index': tr_c},
-                'Test': {'MAE': te_m, 'R2': te_r, 'C_index': te_c}
-            }
-            export_df['Set_MAE'] = export_df['Set'].map(lambda x: metrics_map[x]['MAE'])
-            export_df['Set_R2'] = export_df['Set'].map(lambda x: metrics_map[x]['R2'])
-            export_df['Set_C_index'] = export_df['Set'].map(lambda x: metrics_map[x]['C_index'])
+    if model_name == "Attentive Graph PINN":
+        rows = []
+        organ_names = [n.replace("_SUL", "") for n in NODE_COLS]
 
-            alpha_nd_np = a_nd_all.cpu().numpy()
-            attn_wt_np = w_all.cpu().numpy()
+        for split_name, split_t in [("Train", train_t), ("Test", test_t)]:
+            with torch.no_grad():
+                out = model(split_t["x_str"], split_t["x_raw"], split_t["adj"], split_t["x_cov"], split_t["age"])
+                pred_norm, beta_all, alpha_global, alpha_node, attn_w = out
+                pred_real = safe_inverse_minmax(scaler_y, pred_norm)
 
-            for i, name in enumerate(organ_names):
-                export_df[f'Alpha_{name}'] = alpha_nd_np[:, i]
-                export_df[f'Weight_{name}'] = attn_wt_np[:, i]
+                beta_all = beta_all.detach().cpu().numpy().flatten()
+                alpha_global = alpha_global.detach().cpu().numpy().flatten()
+                alpha_node = alpha_node.detach().cpu().numpy()
+                attn_w = attn_w.detach().cpu().numpy()
 
-            export_df.to_csv('Optimized_Single_PINN_Results.csv', index=False)
-            print(">>> 导出完成: Optimized_Single_PINN_Results.csv")
+                for i, pid in enumerate(split_t["pid"]):
+                    rec = {
+                        "PID": pid,
+                        "Set": split_name,
+                        "Actual_mL": split_t["y_real"][i],
+                        "Pred_mL": pred_real[i],
+                        "Beta": beta_all[i],
+                        "Global_Alpha": alpha_global[i]
+                    }
+                    for j, organ in enumerate(organ_names):
+                        rec[f"Alpha_{organ}"] = alpha_node[i, j]
+                        rec[f"Weight_{organ}"] = attn_w[i, j]
+                    rows.append(rec)
 
-    return [model_name, tr_m, tr_r, tr_c, te_m, te_r, te_c]
+        export_df = pd.DataFrame(rows)
+        export_path = os.path.join(OUTPUT_DIR, "Attentive_Graph_PINN_predictions_and_latents.csv")
+        export_df.to_csv(export_path, index=False)
+        result["attentive_export_path"] = export_path
+
+    return result
 
 
-# ==========================================
-# 4. 执行对比
-# ==========================================
-print(
-    f"{'Model':<25} | {'Train MAE':<10} | {'Train R2':<10} | {'Train C':<8} | {'Test MAE':<10} | {'Test R2':<10} | {'Test C':<8}")
-print("-" * 105)
+def run_ml_baselines(train_t, test_t):
+    X_train, y_train = flatten_baseline_features(train_t)
+    X_test, y_test = flatten_baseline_features(test_t)
 
-res1 = run_experiment("GNN Only", GNN_Only)
-print(
-    f"{res1[0]:<25} | {res1[1]:<10.4f} | {res1[2]:<10.4f} | {res1[3]:<8.4f} | {res1[4]:<10.4f} | {res1[5]:<10.4f} | {res1[6]:<8.4f}")
+    baselines = {
+        "Linear": LinearRegression(),
+        "ElasticNet": ElasticNet(alpha=0.01, l1_ratio=0.5, random_state=3407),
+        "SVR": SVR(C=1.0, epsilon=0.1, kernel="rbf"),
+        "Random Forest": RandomForestRegressor(
+            n_estimators=300, max_depth=None, random_state=3407, n_jobs=-1
+        )
+    }
 
-res2 = run_experiment("GNN + PINN", GNN_PINN)
-print(
-    f"{res2[0]:<25} | {res2[1]:<10.4f} | {res2[2]:<10.4f} | {res2[3]:<8.4f} | {res2[4]:<10.4f} | {res2[5]:<10.4f} | {res2[6]:<8.4f}")
+    if HAS_XGB:
+        baselines["XGBoost"] = XGBRegressor(
+            n_estimators=300,
+            max_depth=4,
+            learning_rate=0.03,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            reg_alpha=0.0,
+            reg_lambda=1.0,
+            objective="reg:squarederror",
+            random_state=3407,
+            n_jobs=-1
+        )
 
-res3 = run_experiment("Attentive Graph PINN", Attentive_Graph_PINN)
-print(
-    f"{res3[0]:<25} | {res3[1]:<10.4f} | {res3[2]:<10.4f} | {res3[3]:<8.4f} | {res3[4]:<10.4f} | {res3[5]:<10.4f} | {res3[6]:<8.4f}")
+    if HAS_LGBM:
+        baselines["LightGBM"] = LGBMRegressor(
+            n_estimators=300,
+            learning_rate=0.03,
+            num_leaves=31,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            random_state=3407
+        )
+
+    results = []
+    for name, model in baselines.items():
+        model.fit(X_train, y_train)
+
+        pred_train = model.predict(X_train)
+        pred_test = model.predict(X_test)
+
+        results.append({
+            "model_name": name,
+            "train_metrics": get_metrics(y_train, pred_train),
+            "test_metrics": get_metrics(y_test, pred_test)
+        })
+
+    return results
+
+
+# =========================================================
+# 5. Main pipeline
+# =========================================================
+def main():
+    df = pd.read_csv(CSV_PATH)
+
+    required_cols = NODE_COLS + [TARGET_COL, AGE_COL, ID_COL, BMI_GROUP_COL] + COV_COLS
+    df = df.dropna(subset=required_cols).copy()
+
+    # -----------------------------------------------------
+    # 5.1 First split: 7:3
+    # -----------------------------------------------------
+    train_df, test_df = train_test_split(
+        df,
+        test_size=TEST_SIZE,
+        random_state=3407,
+        stratify=df[BMI_GROUP_COL] if BMI_GROUP_COL in df.columns else None
+    )
+
+    print(f"Train n = {len(train_df)}, Test n = {len(test_df)}")
+
+    # -----------------------------------------------------
+    # 5.2 Build reference network using TRAIN normal-weight only
+    # -----------------------------------------------------
+    ref_df_train, ref_net_train = build_reference_network(
+        train_df, NODE_COLS, BMI_GROUP_COL, NORMAL_LABEL
+    )
+
+    # -----------------------------------------------------
+    # 5.3 Build features using training-derived reference
+    # -----------------------------------------------------
+    train_data = build_features_from_reference(
+        train_df, ref_df_train, ref_net_train,
+        NODE_COLS, COV_COLS, AGE_COL, TARGET_COL, ID_COL, EDGE_THRESHOLD
+    )
+    test_data = build_features_from_reference(
+        test_df, ref_df_train, ref_net_train,
+        NODE_COLS, COV_COLS, AGE_COL, TARGET_COL, ID_COL, EDGE_THRESHOLD
+    )
+
+    print(f"Feature-built Train n = {len(train_data)}, Test n = {len(test_data)}")
+
+    # -----------------------------------------------------
+    # 5.4 Fit scalers on TRAIN only
+    # -----------------------------------------------------
+    scalers = fit_feature_scalers(train_data)
+
+    # -----------------------------------------------------
+    # 5.5 Transform train/test
+    # -----------------------------------------------------
+    train_t = transform_data(train_data, scalers)
+    test_t = transform_data(test_data, scalers)
+
+    # -----------------------------------------------------
+    # 5.6 Traditional ML baselines
+    # -----------------------------------------------------
+    baseline_results = run_ml_baselines(train_t, test_t)
+
+    # -----------------------------------------------------
+    # 5.7 Graph models
+    # -----------------------------------------------------
+    graph_results = []
+    for model_name, model_class in [
+        ("GNN Only", GNNOnly),
+        ("GNN + PINN", GNNPINN),
+        ("Attentive Graph PINN", AttentiveGraphPINN)
+    ]:
+        res = run_torch_model(
+            model_name=model_name,
+            model_class=model_class,
+            train_t=train_t,
+            test_t=test_t,
+            scaler_y=scalers["scaler_y"],
+            epochs=EPOCHS,
+            patience=PATIENCE,
+            earlystop_monitor_ratio=EARLYSTOP_MONITOR_RATIO
+        )
+        graph_results.append(res)
+
+    # -----------------------------------------------------
+    # 5.8 Summarize performance
+    # -----------------------------------------------------
+    records = []
+    for item in baseline_results:
+        rec = {"Model": item["model_name"]}
+        for split_key, prefix in [("train_metrics", "Train"), ("test_metrics", "Test")]:
+            for m in ["MAE", "R2", "C_index"]:
+                rec[f"{prefix}_{m}"] = item[split_key][m]
+        records.append(rec)
+
+    for item in graph_results:
+        rec = {"Model": item["model_name"]}
+        for split_key, prefix in [("train_metrics", "Train"), ("test_metrics", "Test")]:
+            for m in ["MAE", "R2", "C_index"]:
+                rec[f"{prefix}_{m}"] = item[split_key][m]
+        records.append(rec)
+
+    perf_df = pd.DataFrame(records).sort_values("Model")
+    perf_path = os.path.join(OUTPUT_DIR, "model_performance_summary_7_3.csv")
+    perf_df.to_csv(perf_path, index=False)
+    print("\nSaved:", perf_path)
+    print(perf_df)
+
+if __name__ == "__main__":
+    main()
