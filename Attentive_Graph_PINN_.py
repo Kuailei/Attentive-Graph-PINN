@@ -56,7 +56,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # =========================================================
 # 1. User settings
 # =========================================================
-CSV_PATH = "/mnt/data/df1.csv"      # 改成你的数据路径
+CSV_PATH = "/mnt/data/df1.csv"    
 OUTPUT_DIR = "./ai_outputs_7_3"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
